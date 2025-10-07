@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import React, { useEffect, useState, useRef } from 'react';
 import { encryptData, decryptData } from '@/lib/crypto';
 import PasswordGenerator from '@/components/PasswordGenerator';
+import * as otpauth from 'otpauth';
 
 // --- Type Definitions ---
 type DecryptedVaultItem = {
@@ -15,6 +16,7 @@ type DecryptedVaultItem = {
   url?: string;
   notes?: string;
   tags?: string[];
+  totpSecret?: string;
 };
 
 type NotificationType = {
@@ -59,10 +61,17 @@ export default function Dashboard() {
   const [url, setUrl] = useState('');
   const [notes, setNotes] = useState('');
   const [tags, setTags] = useState<string[]>([]);
+  const [totpSecret, setTotpSecret] = useState('');
+  const [qrCodeUrl, setQrCodeUrl] = useState('');
+  const [verificationCode, setVerificationCode] = useState('');
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [isVerified, setIsVerified] = useState(false);
 
   // Feature State
   const [searchQuery, setSearchQuery] = useState('');
   const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
+  const [currentOtp, setCurrentOtp] = useState('');
+  const [otpExpiresIn, setOtpExpiresIn] = useState(30);
 
   const clipboardClearTimer = useRef<NodeJS.Timeout | null>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
@@ -96,15 +105,35 @@ export default function Dashboard() {
       setUrl(selectedItem.url || '');
       setNotes(selectedItem.notes || '');
       setTags(selectedItem.tags || []);
+      setTotpSecret(selectedItem.totpSecret || '');
+      setQrCodeUrl(''); // Clear QR code when selecting an existing item
+      setIsVerified(!!selectedItem.totpSecret); // If item has TOTP secret, it's already verified
+      setIsVerifying(false);
     }
   }, [selectedItem]);
 
+  // Live TOTP code generation
+  useEffect(() => {
+    if (!selectedItem?.totpSecret) {
+      setCurrentOtp('');
+      return;
+    }
+    const totp = new otpauth.TOTP({ secret: selectedItem.totpSecret });
+    const updateOtp = () => {
+      setCurrentOtp(totp.generate());
+      setOtpExpiresIn(totp.period - (Math.floor(Date.now() / 1000) % totp.period));
+    };
+    updateOtp();
+    const interval = setInterval(updateOtp, 1000);
+    return () => clearInterval(interval);
+  }, [selectedItem]);
 
   // --- UI Control Functions ---
 
   const clearForm = () => {
     setTitle(''); setUsername(''); setPassword(''); setUrl(''); setNotes('');
-    setTags([]);
+    setTags([]); setTotpSecret(''); setQrCodeUrl(''); setVerificationCode('');
+    setIsVerifying(false); setIsVerified(false);
   };
 
   const showList = () => {
@@ -154,7 +183,7 @@ export default function Dashboard() {
     e.preventDefault();
     if (!title || !username || !password) { showNotification("Title, username, and password are required.", 'error'); return; }
 
-    const itemData = { title, username, password, url, notes, tags };
+    const itemData = { title, username, password, url, notes, tags, totpSecret };
     const encryptedData = encryptData(itemData, masterPassword);
 
     const apiEndpoint = selectedItem ? `/api/vault/${selectedItem._id}` : '/api/vault';
@@ -218,6 +247,86 @@ export default function Dashboard() {
     }
   };
 
+  const setupTotp = async () => {
+    try {
+      const res = await fetch('/api/vault/generate-totp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: username || title, issuer: 'PasswordVault' })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setTotpSecret(data.secret);
+        setQrCodeUrl(data.qrCodeUrl);
+        setIsVerifying(true);
+        setIsVerified(false);
+        console.log('TOTP Setup Data:', data);
+        console.log('OTPAuth URL:', data.otpauth_url);
+      } else {
+        throw new Error(data.message || 'Failed to generate TOTP');
+      }
+    } catch (error) {
+      showNotification('Error setting up 2FA.', 'error');
+    }
+  };
+
+  const verifyTotp = () => {
+    if (!verificationCode || verificationCode.length !== 6) {
+      showNotification('Please enter a 6-digit code.', 'error');
+      return;
+    }
+
+    try {
+      // Create TOTP instance exactly as Google Authenticator would interpret the QR code
+      // The secret from our API is already in base32 format
+      const totp = new otpauth.TOTP({
+        secret: totpSecret, // Use the secret directly as it's already base32
+        algorithm: 'SHA1',
+        digits: 6,
+        period: 30,
+      });
+
+      // Get current timestamp in seconds
+      const currentTime = Math.floor(Date.now() / 1000);
+
+      // Generate codes for current time window and adjacent windows
+      const currentPeriod = Math.floor(currentTime / 30);
+      const codes = [];
+
+      // Check current period and ±2 periods (2 minutes total window)
+      for (let i = -2; i <= 2; i++) {
+        const periodTime = (currentPeriod + i) * 30;
+        const code = totp.generate({ timestamp: periodTime * 1000 });
+        codes.push(code);
+      }
+
+      console.log('Valid codes for current time window:', codes);
+      console.log('User entered:', verificationCode);
+      console.log('Current timestamp:', currentTime);
+
+      // Check if the entered code matches any of the valid codes
+      if (codes.includes(verificationCode)) {
+        setIsVerified(true);
+        setIsVerifying(false);
+        showNotification('2FA setup verified successfully!', 'success');
+        console.log('✅ Verification successful!');
+      } else {
+        showNotification(`Invalid code. Please enter the current 6-digit code from your Google Authenticator app.`, 'error');
+        console.log('❌ Code not found in valid time windows');
+      }
+    } catch (error) {
+      console.error('TOTP verification error:', error);
+      showNotification('Error verifying code. Please try again.', 'error');
+    }
+  };
+
+  const cancelTotp = () => {
+    setTotpSecret('');
+    setQrCodeUrl('');
+    setVerificationCode('');
+    setIsVerifying(false);
+    setIsVerified(false);
+  };
 
   const handleExport = () => {
     if (decryptedItems.length === 0) {
@@ -241,7 +350,7 @@ export default function Dashboard() {
 
       if (exportFormat === 'csv') {
         // Create CSV format
-        const headers = ['Title', 'Username', 'Password', 'URL', 'Notes', 'Tags'];
+        const headers = ['Title', 'Username', 'Password', 'URL', 'Notes', 'Tags', 'TOTP Secret'];
         const csvRows = [
           headers.join(','),
           ...decryptedItems.map(item => [
@@ -250,7 +359,8 @@ export default function Dashboard() {
             `"${(item.password || '').replace(/"/g, '""')}"`,
             `"${(item.url || '').replace(/"/g, '""')}"`,
             `"${(item.notes || '').replace(/"/g, '""')}"`,
-            `"${(item.tags || []).join('; ').replace(/"/g, '""')}"`
+            `"${(item.tags || []).join('; ').replace(/"/g, '""')}"`,
+            `"${(item.totpSecret || '').replace(/"/g, '""')}"`
           ].join(','))
         ];
 
@@ -273,7 +383,8 @@ export default function Dashboard() {
             password: item.password || '',
             url: item.url || '',
             notes: item.notes || '',
-            tags: item.tags || []
+            tags: item.tags || [],
+            totpSecret: item.totpSecret || ''
           })),
           footer: {
             poweredBy: "PasswordVault made by Riya Kuila",
@@ -519,8 +630,26 @@ export default function Dashboard() {
               <ul className="space-y-3">
                 {filteredItems.map(item => (
                   <li key={item._id} onClick={() => showDetailsForm(item)} className="p-4 bg-gray-100 rounded-lg cursor-pointer dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600">
-                    <p className="font-semibold">{item.title}</p>
-                    <p className="text-sm text-gray-500 dark:text-gray-400">{item.username}</p>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <p className="font-semibold">{item.title}</p>
+                          {item.totpSecret && (
+                            <span className="px-2 py-1 text-xs font-medium text-blue-700 bg-blue-100 rounded-full dark:text-blue-300 dark:bg-blue-900">
+                              2FA
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-gray-500 dark:text-gray-400">{item.username}</p>
+                      </div>
+                      {item.totpSecret && (
+                        <div className="flex items-center justify-center w-6 h-6 bg-blue-500 rounded-full">
+                          <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.031 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                          </svg>
+                        </div>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -543,6 +672,99 @@ export default function Dashboard() {
                 <textarea placeholder="Notes" value={notes} onChange={e => setNotes(e.target.value)} className="w-full h-24 px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" />
                 <input type="text" placeholder="Tags, separated by commas" value={tags.join(', ')} onChange={e => setTags(e.target.value.split(',').map(tag => tag.trim()).filter(Boolean))} className="w-full px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" />
 
+                {/* 2FA Section */}
+                <div className="pt-4 border-t border-gray-200 dark:border-slate-700">
+                  <h3 className="mb-2 font-semibold">Two-Factor Authentication</h3>
+                  {totpSecret && !isVerifying && isVerified ? (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between p-4 border shadow-xl rounded-2xl backdrop-blur-xl bg-white/80 border-green-200/60 dark:bg-slate-800/80 dark:border-green-700/60">
+                        <div className="flex items-center gap-3">
+                          <div className="flex items-center justify-center w-8 h-8 border rounded-full backdrop-blur-sm bg-green-500/90 border-green-400/30">
+                            <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.031 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                            </svg>
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-semibold text-green-700 dark:text-green-300">2FA Enabled</span>
+                              <span className="px-2 py-1 text-xs font-medium text-green-700 border rounded-full backdrop-blur-sm bg-green-200/80 border-green-300/40 dark:text-green-300 dark:bg-green-800/80 dark:border-green-600/40">VERIFIED</span>
+                            </div>
+                            <span className="text-xs text-green-600 dark:text-green-400">Protected with Time-based OTP</span>
+                          </div>
+                        </div>
+                      </div>
+                      <details className="text-sm">
+                        <summary className="text-gray-600 cursor-pointer dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">View TOTP Secret</summary>
+                        <div className="p-3 mt-2 border rounded-xl backdrop-blur-sm bg-white/60 border-gray-200/40 dark:bg-slate-700/60 dark:border-slate-600/40">
+                          <p className="font-mono text-xs text-gray-700 break-all dark:text-gray-300">{totpSecret}</p>
+                        </div>
+                      </details>
+                    </div>
+                  ) : totpSecret && isVerifying ? (
+                    <div className="space-y-3">
+                      <div className="p-4 border shadow-xl rounded-2xl backdrop-blur-xl bg-white/80 border-blue-200/60 dark:bg-slate-800/80 dark:border-blue-700/60">
+                        <p className="mb-3 text-sm text-blue-700 dark:text-blue-300">
+                          Scan the QR code with your Google Authenticator app, then enter the current 6-digit code to verify:
+                        </p>
+                        {qrCodeUrl && <img src={qrCodeUrl} alt="TOTP QR Code" className="mx-auto mb-3 rounded-lg" />}
+                        <div className="space-y-3">
+                          <div className="relative">
+                            <input
+                              type="text"
+                              value={verificationCode}
+                              onChange={e => setVerificationCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                              placeholder="000000"
+                              className="w-full px-6 py-4 font-mono text-2xl tracking-widest text-center transition-all border-2 outline-none rounded-2xl backdrop-blur-xl bg-white/90 border-blue-300/50 focus:border-blue-500 focus:bg-white focus:shadow-lg focus:shadow-blue-500/20 dark:bg-slate-800/90 dark:border-slate-500/50 dark:focus:bg-slate-800 dark:focus:border-blue-400"
+                              maxLength={6}
+                              autoFocus
+                            />
+                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                              <div className="flex gap-2" style={{ marginTop: '2.5rem' }}>
+                                {[...Array(6)].map((_, i) => (
+                                  <div
+                                    key={i}
+                                    className={`w-8 h-1 rounded-full transition-all duration-300 ${i < verificationCode.length
+                                        ? 'bg-blue-500 shadow-sm shadow-blue-500/50'
+                                        : 'bg-gray-300/50 dark:bg-gray-600/50'
+                                      }`}
+                                  />
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="text-xs text-center text-gray-600 dark:text-gray-400">
+                            Enter the current code from your authenticator app
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={verifyTotp}
+                              disabled={verificationCode.length !== 6}
+                              className="flex-1 px-4 py-2 text-sm text-white transition-all border rounded-xl backdrop-blur-sm bg-green-500/90 border-green-400/30 hover:bg-green-600/95 hover:border-green-300/50 disabled:bg-gray-400/70 disabled:border-gray-400/30 disabled:cursor-not-allowed"
+                            >
+                              Verify Code
+                            </button>
+                            <button
+                              type="button"
+                              onClick={cancelTotp}
+                              className="px-4 py-2 text-sm text-white transition-all border rounded-xl backdrop-blur-sm bg-gray-500/90 border-gray-400/30 hover:bg-gray-600/95 hover:border-gray-300/50"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                      <details className="text-sm">
+                        <summary className="text-gray-600 cursor-pointer dark:text-gray-400">Manual entry (if QR code doesn't work)</summary>
+                        <div className="p-2 mt-2 bg-gray-100 rounded dark:bg-slate-700">
+                          <p className="font-mono text-xs break-all">{totpSecret}</p>
+                        </div>
+                      </details>
+                    </div>
+                  ) : (
+                    <button type="button" onClick={setupTotp} className="w-full px-4 py-2 text-sm bg-gray-200 rounded-md dark:bg-slate-600 hover:bg-gray-300 dark:hover:bg-slate-500">Setup 2FA</button>
+                  )}
+                </div>
 
                 {/* Action Buttons */}
                 <div className="flex flex-col gap-3 pt-2 sm:flex-row sm:justify-between">
@@ -554,8 +776,15 @@ export default function Dashboard() {
               </form>
             </div>
 
-            {/* Side Panel: Password Generator */}
+            {/* Side Panel: Password Generator and 2FA Code Display */}
             <div className="space-y-8">
+              {selectedItem && selectedItem.totpSecret && (
+                <div className="p-6 text-center bg-white rounded-lg shadow-lg dark:bg-slate-800">
+                  <h3 className="mb-2 font-semibold">Authenticator Code</h3>
+                  <p className="font-mono text-4xl tracking-widest text-blue-500 dark:text-blue-400">{currentOtp}</p>
+                  <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">Refreshes in {otpExpiresIn}s</p>
+                </div>
+              )}
               <PasswordGenerator />
             </div>
           </div>
