@@ -5,7 +5,6 @@ import { useRouter } from 'next/navigation';
 import React, { useEffect, useState, useRef } from 'react';
 import { encryptData, decryptData } from '@/lib/crypto';
 import PasswordGenerator from '@/components/PasswordGenerator';
-import * as otpauth from 'otpauth';
 
 // --- Type Definitions ---
 type DecryptedVaultItem = {
@@ -16,7 +15,6 @@ type DecryptedVaultItem = {
   url?: string;
   notes?: string;
   tags?: string[];
-  totpSecret?: string;
 };
 
 type NotificationType = {
@@ -32,17 +30,20 @@ export default function Dashboard() {
   // --- State Management ---
   const [decryptedItems, setDecryptedItems] = useState<DecryptedVaultItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  
+
   // UI Control State
   const [activeView, setActiveView] = useState<'list' | 'form'>('list');
   const [notification, setNotification] = useState<NotificationType | null>(null);
-  
+
   // Modals State
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [itemToDelete, setItemToDelete] = useState<DecryptedVaultItem | null>(null);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [importFileContent, setImportFileContent] = useState<string | null>(null);
   const [importPassword, setImportPassword] = useState('');
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [exportPassword, setExportPassword] = useState('');
+  const [exportFormat, setExportFormat] = useState<'json' | 'csv'>('csv');
 
 
   // Unlock State
@@ -58,20 +59,16 @@ export default function Dashboard() {
   const [url, setUrl] = useState('');
   const [notes, setNotes] = useState('');
   const [tags, setTags] = useState<string[]>([]);
-  const [totpSecret, setTotpSecret] = useState('');
-  const [qrCodeUrl, setQrCodeUrl] = useState('');
 
   // Feature State
   const [searchQuery, setSearchQuery] = useState('');
   const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
-  const [currentOtp, setCurrentOtp] = useState('');
-  const [otpExpiresIn, setOtpExpiresIn] = useState(30);
-  
+
   const clipboardClearTimer = useRef<NodeJS.Timeout | null>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
 
   // --- Effects ---
-  
+
   // Helper to show notifications
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
     setNotification({ message, type });
@@ -99,32 +96,15 @@ export default function Dashboard() {
       setUrl(selectedItem.url || '');
       setNotes(selectedItem.notes || '');
       setTags(selectedItem.tags || []);
-      setTotpSecret(selectedItem.totpSecret || '');
-      setQrCodeUrl(''); // Clear QR code when selecting an existing item
     }
   }, [selectedItem]);
 
-  // Live TOTP code generation
-  useEffect(() => {
-    if (!selectedItem?.totpSecret) {
-      setCurrentOtp('');
-      return;
-    }
-    const totp = new otpauth.TOTP({ secret: selectedItem.totpSecret });
-    const updateOtp = () => {
-      setCurrentOtp(totp.generate());
-      setOtpExpiresIn(totp.period - (Math.floor(Date.now() / 1000) % totp.period));
-    };
-    updateOtp();
-    const interval = setInterval(updateOtp, 1000);
-    return () => clearInterval(interval);
-  }, [selectedItem]);
 
   // --- UI Control Functions ---
 
   const clearForm = () => {
     setTitle(''); setUsername(''); setPassword(''); setUrl(''); setNotes('');
-    setTags([]); setTotpSecret(''); setQrCodeUrl('');
+    setTags([]);
   };
 
   const showList = () => {
@@ -132,7 +112,7 @@ export default function Dashboard() {
     setSelectedItem(null);
     clearForm();
   };
-  
+
   const showAddForm = () => {
     setSelectedItem(null);
     clearForm();
@@ -143,9 +123,9 @@ export default function Dashboard() {
     setSelectedItem(item);
     setActiveView('form');
   };
-  
+
   // --- Core Logic Functions ---
-  
+
   const handleUnlockVault = async () => {
     if (!masterPassword) { setUnlockError('Please enter master password.'); return; }
     setIsLoading(true); setUnlockError('');
@@ -166,15 +146,15 @@ export default function Dashboard() {
           setIsUnlocked(true);
         }
       } else { throw new Error(data.message); }
-    } catch (error: any) { setUnlockError(error.message); } 
+    } catch (error: any) { setUnlockError(error.message); }
     finally { setIsLoading(false); }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title || !username || !password) { showNotification("Title, username, and password are required.", 'error'); return; }
-    
-    const itemData = { title, username, password, url, notes, tags, totpSecret };
+
+    const itemData = { title, username, password, url, notes, tags };
     const encryptedData = encryptData(itemData, masterPassword);
 
     const apiEndpoint = selectedItem ? `/api/vault/${selectedItem._id}` : '/api/vault';
@@ -189,7 +169,7 @@ export default function Dashboard() {
       const data = await res.json();
       if (data.success) {
         if (selectedItem) {
-          setDecryptedItems(decryptedItems.map(item => 
+          setDecryptedItems(decryptedItems.map(item =>
             item._id === selectedItem._id ? { ...itemData, _id: selectedItem._id } : item
           ));
         } else {
@@ -204,7 +184,7 @@ export default function Dashboard() {
   const handleDeleteClick = (item: DecryptedVaultItem) => {
     setItemToDelete(item); setIsDeleteModalOpen(true);
   };
-  
+
   const confirmDeleteItem = async () => {
     if (!itemToDelete) return;
     try {
@@ -214,7 +194,7 @@ export default function Dashboard() {
         setDecryptedItems(decryptedItems.filter(item => item._id !== itemToDelete._id));
         showNotification(`Deleted "${itemToDelete.title}" successfully!`);
       } else { throw new Error(data.message); }
-    } catch (error) { showNotification('An error occurred while deleting.', 'error'); } 
+    } catch (error) { showNotification('An error occurred while deleting.', 'error'); }
     finally { setIsDeleteModalOpen(false); setItemToDelete(null); showList(); }
   };
 
@@ -238,43 +218,87 @@ export default function Dashboard() {
     }
   };
 
-  const setupTotp = async () => {
-    try {
-      const res = await fetch('/api/vault/generate-totp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: username || title, issuer: 'LockBox' })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setTotpSecret(data.secret);
-        setQrCodeUrl(data.qrCodeUrl);
-      } else {
-        throw new Error(data.message || 'Failed to generate TOTP');
-      }
-    } catch (error) { showNotification('Error setting up 2FA.', 'error'); }
-  };
 
   const handleExport = () => {
     if (decryptedItems.length === 0) {
       showNotification('Vault is empty, nothing to export.', 'error');
       return;
     }
-    const password = prompt("Confirm your master password to encrypt the export file:");
-    if (!password || password !== masterPassword) {
-      alert("Incorrect master password.");
+    setIsExportModalOpen(true);
+  };
+
+  const confirmExport = () => {
+    if (!exportPassword || exportPassword !== masterPassword) {
+      showNotification('Incorrect master password.', 'error');
       return;
     }
-    const dataToExport = { version: "1.0", items: decryptedItems };
-    const encryptedExport = encryptData(dataToExport, password);
-    const blob = new Blob([encryptedExport], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `lockbox_export_${Date.now()}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showNotification('Vault exported successfully!');
+
+    try {
+      const dateStr = new Date().toISOString().split('T')[0];
+      let content: string;
+      let filename: string;
+      let mimeType: string;
+
+      if (exportFormat === 'csv') {
+        // Create CSV format
+        const headers = ['Title', 'Username', 'Password', 'URL', 'Notes', 'Tags'];
+        const csvRows = [
+          headers.join(','),
+          ...decryptedItems.map(item => [
+            `"${(item.title || '').replace(/"/g, '""')}"`,
+            `"${(item.username || '').replace(/"/g, '""')}"`,
+            `"${(item.password || '').replace(/"/g, '""')}"`,
+            `"${(item.url || '').replace(/"/g, '""')}"`,
+            `"${(item.notes || '').replace(/"/g, '""')}"`,
+            `"${(item.tags || []).join('; ').replace(/"/g, '""')}"`
+          ].join(','))
+        ];
+
+        content = csvRows.join('\n');
+        filename = `passwordvault_export_${dateStr}.csv`;
+        mimeType = 'text/csv;charset=utf-8';
+      } else {
+        // Create JSON format
+        const exportData = {
+          exportInfo: {
+            version: "1.0",
+            exportDate: new Date().toISOString(),
+            totalItems: decryptedItems.length,
+            source: "PasswordVault made by Riya Kuila",
+            poweredBy: "PasswordVault made by Riya Kuila"
+          },
+          vaultItems: decryptedItems.map(item => ({
+            title: item.title,
+            username: item.username,
+            password: item.password || '',
+            url: item.url || '',
+            notes: item.notes || '',
+            tags: item.tags || []
+          })),
+          footer: {
+            poweredBy: "PasswordVault made by Riya Kuila",
+            exportedOn: new Date().toLocaleString()
+          }
+        };
+        content = JSON.stringify(exportData, null, 2);
+        filename = `passwordvault_export_${dateStr}.json`;
+        mimeType = 'application/json;charset=utf-8';
+      }
+
+      const blob = new Blob([content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      showNotification(`Vault exported successfully as ${exportFormat.toUpperCase()}!`);
+    } catch (error) {
+      showNotification('Error exporting vault.', 'error');
+    } finally {
+      setIsExportModalOpen(false);
+      setExportPassword('');
+    }
   };
 
   const handleImportFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -303,16 +327,16 @@ export default function Dashboard() {
         throw new Error("Decryption failed. Check password or file format.");
       }
       const itemsToImport = (decryptedData as any).items;
-      
+
       setIsLoading(true);
       let successCount = 0;
       for (const item of itemsToImport) {
         const { _id, ...itemData } = item; // Exclude old ID
         const encryptedData = encryptData(itemData, masterPassword);
         const res = await fetch('/api/vault', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ encryptedData })
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ encryptedData })
         });
         if (res.ok) successCount++;
       }
@@ -328,13 +352,13 @@ export default function Dashboard() {
       setImportPassword('');
     }
   };
-  
+
   // --- Render Filtering ---
-  
+
   const allTags = [...new Set(decryptedItems.flatMap(item => item.tags || []))].sort();
-  
+
   const filteredItems = decryptedItems.filter(item => {
-    const matchesSearch = searchQuery ? 
+    const matchesSearch = searchQuery ?
       item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
       item.username.toLowerCase().includes(searchQuery.toLowerCase()) : true;
     const matchesTag = activeTagFilter ? item.tags?.includes(activeTagFilter) : true;
@@ -343,17 +367,17 @@ export default function Dashboard() {
 
   // --- JSX Output ---
 
-  if (status === 'loading') return <div className="flex h-screen items-center justify-center bg-gray-100 dark:bg-gray-900"><p>Loading...</p></div>;
+  if (status === 'loading') return <div className="flex items-center justify-center h-screen bg-gray-100 dark:bg-gray-900"><p>Loading...</p></div>;
   if (!session) return null;
 
   if (!isUnlocked) {
     return (
-      <div className="flex h-screen items-center justify-center bg-gray-100 dark:bg-gray-900">
-        <div className="w-full max-w-sm p-8 space-y-4 bg-white dark:bg-slate-800 rounded-xl shadow-lg">
+      <div className="flex items-center justify-center h-screen bg-gray-100 dark:bg-gray-900">
+        <div className="w-full max-w-sm p-8 space-y-4 bg-white shadow-lg rounded-xl dark:bg-slate-800">
           <h2 className="text-2xl font-bold text-center text-gray-900 dark:text-white">Unlock Your LockBox</h2>
-          <input type="password" value={masterPassword} onChange={e => setMasterPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleUnlockVault()} placeholder="Master Password" className="w-full px-3 py-2 text-gray-900 dark:text-white bg-gray-200 dark:bg-slate-700 rounded-md"/>
-          {unlockError && <p className="text-red-500 text-sm text-center">{unlockError}</p>}
-          <button onClick={handleUnlockVault} disabled={isLoading} className="w-full py-3 font-bold text-white bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 focus:outline-none focus:ring-4 focus:ring-purple-300 dark:focus:ring-purple-800 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+          <input type="password" value={masterPassword} onChange={e => setMasterPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleUnlockVault()} placeholder="Master Password" className="w-full px-3 py-2 text-gray-900 bg-gray-200 rounded-md dark:text-white dark:bg-slate-700" />
+          {unlockError && <p className="text-sm text-center text-red-500">{unlockError}</p>}
+          <button onClick={handleUnlockVault} disabled={isLoading} className="w-full py-3 font-bold text-white transition-all rounded-lg bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 focus:outline-none focus:ring-4 focus:ring-purple-300 dark:focus:ring-purple-800 disabled:opacity-50 disabled:cursor-not-allowed">
             {isLoading ? 'Unlocking...' : 'Unlock'}
           </button>
         </div>
@@ -362,29 +386,99 @@ export default function Dashboard() {
   }
 
   return (
-    <main className="min-h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-white pt-20">
+    <main className="min-h-screen pt-20 text-gray-900 bg-gray-100 dark:bg-gray-900 dark:text-white">
       {/* --- Modals and Notifications --- */}
       {isDeleteModalOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-lg p-8 max-w-sm w-full shadow-xl">
-            <h3 className="text-xl font-bold mb-4">Confirm Deletion</h3>
-            <p className="text-gray-600 dark:text-gray-300 mb-6">Permanently delete <span className="font-semibold">"{itemToDelete?.title}"</span>?</p>
-            <div className="flex justify-end gap-4">
-              <button onClick={() => setIsDeleteModalOpen(false)} className="px-4 py-2 font-semibold bg-gray-200 dark:bg-gray-600 rounded-lg">Cancel</button>
-              <button onClick={confirmDeleteItem} className="px-4 py-2 font-semibold text-white bg-red-600 rounded-lg">Delete</button>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-sm sm:p-6 bg-black/50">
+          <div className="w-full max-w-sm p-6 mx-4 border shadow-2xl rounded-2xl backdrop-blur-xl sm:p-8 sm:mx-0 bg-white/90 border-white/20 dark:bg-slate-800/90 dark:border-slate-700/30">
+            <h3 className="mb-4 text-xl font-bold">Confirm Deletion</h3>
+            <p className="mb-6 text-gray-600 dark:text-gray-300">Permanently delete <span className="font-semibold">"{itemToDelete?.title}"</span>?</p>
+            <div className="flex flex-col gap-3 sm:flex-row sm:gap-4 sm:justify-end">
+              <button onClick={() => setIsDeleteModalOpen(false)} className="order-2 px-4 py-2 font-semibold transition-all border rounded-xl backdrop-blur-sm bg-white/70 border-gray-200/50 hover:bg-white/90 dark:bg-slate-600/70 dark:border-slate-500/50 dark:hover:bg-slate-600/90 sm:order-1">Cancel</button>
+              <button onClick={confirmDeleteItem} className="order-1 px-4 py-2 font-semibold text-white transition-all border rounded-xl backdrop-blur-sm bg-red-500/90 border-red-400/30 hover:bg-red-600/95 hover:border-red-300/50 sm:order-2">Delete</button>
             </div>
           </div>
         </div>
       )}
       {isImportModalOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-lg p-8 max-w-sm w-full shadow-xl">
-            <h3 className="text-xl font-bold mb-4">Confirm Import</h3>
-            <p className="text-gray-600 dark:text-gray-300 mb-6">Enter the master password for this backup file to decrypt and import its contents.</p>
-            <input type="password" value={importPassword} onChange={e => setImportPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && confirmImport()} placeholder="Backup's Master Password" className="w-full px-3 py-2 mb-6 text-gray-900 dark:text-white bg-gray-200 dark:bg-slate-700 rounded-md"/>
-            <div className="flex justify-end gap-4">
-              <button onClick={() => setIsImportModalOpen(false)} className="px-4 py-2 font-semibold bg-gray-200 dark:bg-gray-600 rounded-lg">Cancel</button>
-              <button onClick={confirmImport} disabled={isLoading} className="px-4 py-2 font-semibold text-white bg-blue-600 rounded-lg disabled:bg-gray-500">{isLoading ? 'Importing...' : 'Import Items'}</button>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-sm sm:p-6 bg-black/50">
+          <div className="w-full max-w-sm p-6 mx-4 border shadow-2xl rounded-2xl backdrop-blur-xl sm:p-8 sm:mx-0 bg-white/90 border-white/20 dark:bg-slate-800/90 dark:border-slate-700/30">
+            <h3 className="mb-4 text-xl font-bold">Confirm Import</h3>
+            <p className="mb-6 text-gray-600 dark:text-gray-300">Enter the master password for this backup file to decrypt and import its contents.</p>
+            <input type="password" value={importPassword} onChange={e => setImportPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && confirmImport()} placeholder="Backup's Master Password" className="w-full px-4 py-3 mb-6 text-gray-900 transition-all border outline-none rounded-xl backdrop-blur-sm bg-white/60 border-gray-200/50 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-300/50 focus:bg-white/80 dark:text-white dark:bg-slate-700/60 dark:border-slate-600/50 dark:focus:bg-slate-700/80" />
+            <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
+              <button onClick={() => setIsImportModalOpen(false)} className="order-2 px-6 py-2 font-semibold transition-all border rounded-xl backdrop-blur-sm bg-white/70 border-gray-200/50 hover:bg-white/90 hover:border-gray-300/60 dark:bg-slate-600/70 dark:border-slate-500/50 dark:hover:bg-slate-600/90 sm:order-1">Cancel</button>
+              <button onClick={confirmImport} disabled={isLoading} className="order-1 px-6 py-2 font-semibold text-white transition-all border rounded-xl backdrop-blur-sm bg-blue-500/90 border-blue-400/30 hover:bg-blue-600/95 hover:border-blue-300/50 disabled:bg-gray-400/70 disabled:border-gray-400/30 disabled:cursor-not-allowed sm:order-2">{isLoading ? 'Importing...' : 'Import Items'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {isExportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-sm sm:p-6 bg-black/50">
+          <div className="w-full max-w-sm p-6 mx-4 border shadow-2xl rounded-2xl backdrop-blur-xl sm:p-8 sm:mx-0 bg-white/90 border-white/20 dark:bg-slate-800/90 dark:border-slate-700/30">
+            <div className="flex flex-col items-center mb-6 text-center sm:flex-row sm:items-center sm:mb-4 sm:text-left">
+              <div className="flex items-center justify-center w-12 h-12 mb-3 border rounded-full backdrop-blur-sm sm:mb-0 sm:mr-4 bg-blue-100/70 border-blue-200/50 dark:bg-blue-900/70 dark:border-blue-800/50">
+                <svg className="w-6 h-6 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+              </div>
+              <h3 className="text-xl font-bold">Export Vault</h3>
+            </div>
+            <p className="mb-4 text-center text-gray-600 dark:text-gray-300 sm:text-left">
+              Confirm your master password to export your vault data in readable format. This will contain all your passwords and vault items in plain text.
+            </p>
+
+            {/* Format Selection */}
+            <div className="mb-6">
+              <label className="block mb-3 text-sm font-medium text-gray-700 dark:text-gray-300">Export Format:</label>
+              <div className="flex gap-4">
+                <label className="flex items-center cursor-pointer">
+                  <input
+                    type="radio"
+                    name="exportFormat"
+                    value="csv"
+                    checked={exportFormat === 'csv'}
+                    onChange={(e) => setExportFormat(e.target.value as 'json' | 'csv')}
+                    className="mr-2 text-blue-600 focus:ring-blue-500"
+                  />
+                  <span className="text-sm">CSV (Spreadsheet)</span>
+                </label>
+                <label className="flex items-center cursor-pointer">
+                  <input
+                    type="radio"
+                    name="exportFormat"
+                    value="json"
+                    checked={exportFormat === 'json'}
+                    onChange={(e) => setExportFormat(e.target.value as 'json' | 'csv')}
+                    className="mr-2 text-blue-600 focus:ring-blue-500"
+                  />
+                  <span className="text-sm">JSON (Structured)</span>
+                </label>
+              </div>
+            </div>
+
+            <input
+              type="password"
+              value={exportPassword}
+              onChange={e => setExportPassword(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && confirmExport()}
+              placeholder="Enter your master password"
+              className="w-full px-4 py-3 mb-6 text-gray-900 transition-all border outline-none rounded-xl backdrop-blur-sm bg-white/60 border-gray-200/50 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-300/50 focus:bg-white/80 dark:text-white dark:bg-slate-700/60 dark:border-slate-600/50 dark:focus:bg-slate-700/80"
+            />
+            <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
+              <button
+                onClick={() => { setIsExportModalOpen(false); setExportPassword(''); }}
+                className="order-2 px-6 py-2 font-semibold text-gray-700 transition-all border rounded-xl backdrop-blur-sm bg-white/70 border-gray-200/50 hover:bg-white/90 hover:border-gray-300/60 dark:text-gray-300 dark:bg-slate-600/70 dark:border-slate-500/50 dark:hover:bg-slate-600/90 sm:order-1"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmExport}
+                disabled={!exportPassword}
+                className="order-1 px-6 py-2 font-semibold text-white transition-all border bg-gradient-to-r rounded-xl backdrop-blur-sm from-blue-500/90 to-purple-600/90 border-blue-400/30 hover:from-blue-600/95 hover:to-purple-700/95 hover:border-blue-300/50 disabled:from-gray-400/70 disabled:to-gray-500/70 disabled:cursor-not-allowed disabled:border-gray-400/30 sm:order-2"
+              >
+                Export Vault
+              </button>
             </div>
           </div>
         </div>
@@ -395,36 +489,36 @@ export default function Dashboard() {
         </div>
       )}
 
-      <div className="container mx-auto max-w-4xl px-4 py-8">
+      <div className="container max-w-4xl px-4 py-8 mx-auto">
         {activeView === 'list' ? (
           // --- ITEM LIST VIEW ---
-          <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-lg">
-            <div className="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4">
+          <div className="p-6 bg-white rounded-lg shadow-lg dark:bg-slate-800">
+            <div className="flex flex-col items-center justify-between gap-4 mb-6 sm:flex-row">
               <h2 className="text-3xl font-bold">Vault Items</h2>
-              <button onClick={showAddForm} className="w-full sm:w-auto px-4 py-2 font-bold text-white bg-blue-600 rounded-lg hover:bg-blue-700">
+              <button onClick={showAddForm} className="w-full px-4 py-2 font-bold text-white bg-blue-600 rounded-lg sm:w-auto hover:bg-blue-700">
                 + Add New
               </button>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-              <input type="text" placeholder="Search vault..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full md:col-span-2 px-4 py-3 bg-gray-100 dark:bg-slate-700 rounded-md"/>
+            <div className="grid grid-cols-1 gap-4 mb-4 md:grid-cols-3">
+              <input type="text" placeholder="Search vault..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full px-4 py-3 bg-gray-100 rounded-md md:col-span-2 dark:bg-slate-700" />
               <div className="flex justify-end gap-2">
-                 <button onClick={handleExport} className="w-1/2 md:w-auto px-3 py-2 text-sm bg-gray-200 dark:bg-slate-600 rounded-md">Export</button>
-                 <button onClick={() => importFileRef.current?.click()} className="w-1/2 md:w-auto px-3 py-2 text-sm bg-gray-200 dark:bg-slate-600 rounded-md">Import</button>
-                 <input type="file" ref={importFileRef} onChange={handleImportFileSelect} accept=".txt" className="hidden" />
+                <button onClick={handleExport} className="w-1/2 px-3 py-2 text-sm bg-gray-200 rounded-md md:w-auto dark:bg-slate-600">Export</button>
+                <button onClick={() => importFileRef.current?.click()} className="w-1/2 px-3 py-2 text-sm bg-gray-200 rounded-md md:w-auto dark:bg-slate-600">Import</button>
+                <input type="file" ref={importFileRef} onChange={handleImportFileSelect} accept=".txt" className="hidden" />
               </div>
             </div>
-            <div className="flex flex-wrap gap-2 mb-6 border-b border-gray-200 dark:border-slate-700 pb-4">
-              <button onClick={() => setActiveTagFilter(null)} className={`px-3 py-1 text-sm rounded-full ${!activeTagFilter ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-slate-600'}`}>All</button>
+            <div className="flex flex-wrap gap-2 pb-4 mb-6 border-b border-gray-200 dark:border-slate-700">
+              <button onClick={() => setActiveTagFilter(null)} className={`px-3 py-1 text-sm rounded-full ${!activeTagFilter ? 'text-white bg-blue-600' : 'bg-gray-200 dark:bg-slate-600'}`}>All</button>
               {allTags.map(tag => (
-                  <button key={tag} onClick={() => setActiveTagFilter(tag)} className={`px-3 py-1 text-sm rounded-full ${activeTagFilter === tag ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-slate-600'}`}>{tag}</button>
+                <button key={tag} onClick={() => setActiveTagFilter(tag)} className={`px-3 py-1 text-sm rounded-full ${activeTagFilter === tag ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-slate-600'}`}>{tag}</button>
               ))}
             </div>
             {filteredItems.length === 0 ? (
-              <p className="text-gray-500 dark:text-gray-400 text-center py-4">No items found.</p>
+              <p className="py-4 text-center text-gray-500 dark:text-gray-400">No items found.</p>
             ) : (
               <ul className="space-y-3">
                 {filteredItems.map(item => (
-                  <li key={item._id} onClick={() => showDetailsForm(item)} className="p-4 rounded-lg cursor-pointer bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600">
+                  <li key={item._id} onClick={() => showDetailsForm(item)} className="p-4 bg-gray-100 rounded-lg cursor-pointer dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600">
                     <p className="font-semibold">{item.title}</p>
                     <p className="text-sm text-gray-500 dark:text-gray-400">{item.username}</p>
                   </li>
@@ -434,54 +528,34 @@ export default function Dashboard() {
           </div>
         ) : (
           // --- ADD/EDIT ITEM VIEW ---
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
-            <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-lg">
+          <div className="grid items-start grid-cols-1 gap-8 lg:grid-cols-2">
+            <div className="p-6 bg-white rounded-lg shadow-lg dark:bg-slate-800">
               <div className="flex items-center mb-6">
-                <button onClick={showList} className="mr-4 p-2 rounded-full hover:bg-gray-200 dark:hover:bg-slate-700">&larr;</button>
+                <button onClick={showList} className="p-2 mr-4 rounded-full hover:bg-gray-200 dark:hover:bg-slate-700">&larr;</button>
                 <h2 className="text-3xl font-bold">{selectedItem ? 'Item Details' : 'Add New Item'}</h2>
               </div>
               <form onSubmit={handleSubmit} className="space-y-4">
                 {/* Standard Fields */}
-                <input type="text" placeholder="Title" value={title} onChange={e => setTitle(e.target.value)} className="w-full px-4 py-3 bg-gray-100 dark:bg-slate-700 rounded-md" required/>
-                <input type="text" placeholder="Username or Email" value={username} onChange={e => setUsername(e.target.value)} className="w-full px-4 py-3 bg-gray-100 dark:bg-slate-700 rounded-md" required/>
-                <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} className="w-full px-4 py-3 bg-gray-100 dark:bg-slate-700 rounded-md" required/>
-                <input type="url" placeholder="URL (e.g., https://google.com)" value={url} onChange={e => setUrl(e.target.value)} className="w-full px-4 py-3 bg-gray-100 dark:bg-slate-700 rounded-md"/>
-                <textarea placeholder="Notes" value={notes} onChange={e => setNotes(e.target.value)} className="w-full px-4 py-3 bg-gray-100 dark:bg-slate-700 rounded-md h-24"/>
-                <input type="text" placeholder="Tags, separated by commas" value={tags.join(', ')} onChange={e => setTags(e.target.value.split(',').map(tag => tag.trim()).filter(Boolean))} className="w-full px-4 py-3 bg-gray-100 dark:bg-slate-700 rounded-md"/>
-                
-                {/* 2FA Section */}
-                <div className="border-t border-gray-200 dark:border-slate-700 pt-4">
-                  <h3 className="font-semibold mb-2">Two-Factor Authentication</h3>
-                  {totpSecret ? (
-                      <div className="space-y-2">
-                         <input type="text" readOnly value={totpSecret} className="w-full px-4 py-2 font-mono text-sm bg-gray-200 dark:bg-slate-600 rounded-md"/>
-                         {qrCodeUrl && <img src={qrCodeUrl} alt="TOTP QR Code" className="mx-auto rounded-lg"/>}
-                         <button type="button" onClick={() => {setTotpSecret(''); setQrCodeUrl('');}} className="text-sm text-red-500">Remove 2FA</button>
-                      </div>
-                  ) : (
-                      <button type="button" onClick={setupTotp} className="w-full px-4 py-2 text-sm bg-gray-200 dark:bg-slate-600 rounded-md">Setup 2FA</button>
-                  )}
-                </div>
+                <input type="text" placeholder="Title" value={title} onChange={e => setTitle(e.target.value)} className="w-full px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" required />
+                <input type="text" placeholder="Username or Email" value={username} onChange={e => setUsername(e.target.value)} className="w-full px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" required />
+                <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} className="w-full px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" required />
+                <input type="url" placeholder="URL (e.g., https://google.com)" value={url} onChange={e => setUrl(e.target.value)} className="w-full px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" />
+                <textarea placeholder="Notes" value={notes} onChange={e => setNotes(e.target.value)} className="w-full h-24 px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" />
+                <input type="text" placeholder="Tags, separated by commas" value={tags.join(', ')} onChange={e => setTags(e.target.value.split(',').map(tag => tag.trim()).filter(Boolean))} className="w-full px-4 py-3 bg-gray-100 rounded-md dark:bg-slate-700" />
+
 
                 {/* Action Buttons */}
-                <div className="flex flex-col sm:flex-row sm:justify-between gap-3 pt-2">
+                <div className="flex flex-col gap-3 pt-2 sm:flex-row sm:justify-between">
                   {selectedItem && (
-                    <button type="button" onClick={() => handleDeleteClick(selectedItem)} className="w-full sm:w-auto px-6 py-3 font-bold text-white bg-red-600 rounded-lg order-2 sm:order-1">Delete</button>
+                    <button type="button" onClick={() => handleDeleteClick(selectedItem)} className="order-2 w-full px-6 py-3 font-bold text-white bg-red-600 rounded-lg sm:w-auto sm:order-1">Delete</button>
                   )}
-                  <button type="submit" className="w-full sm:w-auto px-6 py-3 font-bold text-white bg-blue-600 rounded-lg order-1 sm:order-2">{selectedItem ? 'Update Item' : 'Save Item'}</button>
+                  <button type="submit" className="order-1 w-full px-6 py-3 font-bold text-white bg-blue-600 rounded-lg sm:w-auto sm:order-2">{selectedItem ? 'Update Item' : 'Save Item'}</button>
                 </div>
               </form>
             </div>
 
-            {/* Side Panel: Password Generator and 2FA Code Display */}
+            {/* Side Panel: Password Generator */}
             <div className="space-y-8">
-              {selectedItem && selectedItem.totpSecret && (
-                <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-lg text-center">
-                  <h3 className="font-semibold mb-2">Authenticator Code</h3>
-                  <p className="font-mono text-4xl tracking-widest text-blue-500 dark:text-blue-400">{currentOtp}</p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">Refreshes in {otpExpiresIn}s</p>
-                </div>
-              )}
               <PasswordGenerator />
             </div>
           </div>
